@@ -1,6 +1,8 @@
 import { expect } from 'chai'
 import balancer, { _internal, Backend } from "../src/balancer"
 
+import { AVERAGE_LATENCY_EXPECTED } from '../balancer-config';
+
 async function fakeFetch(req: RequestInfo, init?: RequestInit) {
   return new Response("hi")
 }
@@ -12,47 +14,53 @@ function healthy() {
   return <Backend>{
     proxy: fakeFetch.bind({}), // same function, different times
     requestCount: 0,
-    statuses: [200, 200, 200],
+    statuses: Array(3).fill(200),
+    latencies: Array(3).fill(AVERAGE_LATENCY_EXPECTED),
     lastError: 0,
     healthScore: 1,
+    latencyScore: 1,
+    score: 1,
     errorCount: 0
   }
 }
 function unhealthy(score?: number) {
   const b = healthy()
+  const unhealthLatency = AVERAGE_LATENCY_EXPECTED * 2
   b.statuses.push(500, 500, 500)
+  b.latencies.push(unhealthLatency, unhealthLatency, unhealthLatency)
   b.healthScore = score || 0.5
+  b.latencyScore = score || 0.5
+  b.score = score || 0.5
   return b
 }
 describe("balancing", () => {
   describe("backend scoring", () => {
     it("should score healthy backends high", () => {
       const backend = healthy()
-      const score = _internal.score(backend)
+      const [healthScore, latencyScore, score] = _internal.score(backend)
 
       expect(score).to.eq(1)
     })
 
     it("should score unhealthy backends low", () => {
       const backend = unhealthy()
-      const score = _internal.score(backend, 0)
+      const [healthScore, latencyScore, score] = _internal.score(backend, 0)
 
       expect(score).to.eq(0.5)
     })
 
-
     it("should give less weight to older errors", () => {
       const backend = unhealthy()
-      let score = _internal.score(backend, backend.lastError + 999)
-      expect(score).to.eq(0.5)
+      let [healthScore, latencyScore, score] = _internal.score(backend, backend.lastError + 999)
+      expect(healthScore).to.eq(0.5)
 
-      score = _internal.score(backend, backend.lastError + 2000) // 2s old error
+      score = _internal.score(backend, backend.lastError + 2000)[0] // 2s old error
       expect(score).to.eq(0.6)
 
-      score = _internal.score(backend, backend.lastError + 4000) // 4s old error
+      score = _internal.score(backend, backend.lastError + 4000)[0] // 4s old error
       expect(score).to.eq(0.85)
 
-      score = _internal.score(backend, backend.lastError + 9000) // 9s old error
+      score = _internal.score(backend, backend.lastError + 9000)[0] // 9s old error
       expect(score).to.eq(0.95)
     })
   })

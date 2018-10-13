@@ -1,17 +1,29 @@
 /**
- * A fetch function load balancer. Distributes requests to a set of backends; attempts to 
- * send requests to most recently healthy backends using a 2 random (pick two healthiest, 
+ * A fetch function load balancer. Distributes requests to a set of backends; attempts to
+ * send requests to most recently healthy backends using a 2 random (pick two healthiest,
  * randomize which gets requests).
- * 
+ *
  * If all backends are healthy, tries to evenly distribute requests as much as possible.
- * 
+ *
  * When backends return server errors (500-599) it retries idempotent requests
  *  until it gets a good response, or all backends have been tried.
- * 
+ *
  * @param backends fetch functions for each backend to balance accross
- * @returns a function that behaves just like fetch, with a `.backends` property for 
+ * @returns a function that behaves just like fetch, with a `.backends` property for
  * retrieving backend stats.
  */
+
+ import {
+   LATENCY_DEVIATION_ALLOWED,
+   AVERAGE_LATENCY_EXPECTED,
+   HEALTH_SCORE_WEIGHT,
+   LATENCY_SCORE_WEIGHT,
+   LATENCY_SCORE_INSTABILITY_WEIGHT,
+ } from '../balancer-config'
+
+ // todo: when the load balancer loads, get old score values from a database
+ // accept the old score values as a param in the balancer
+
 export default function balancer(backends: FetchFn[]) {
   const tracked = backends.map((h) => {
     if (typeof h !== "function") {
@@ -22,9 +34,12 @@ export default function balancer(backends: FetchFn[]) {
       requestCount: 0,
       scoredRequestCount: 0,
       statuses: Array<number>(10),
-      lastError: 0,
+      latencies: Array<number>(10),
       healthScore: 1,
-      errorCount: 0
+      latencyScore: 1,
+      score: 1,
+      lastError: 0,
+      errorCount: 0,
     }
   })
 
@@ -33,50 +48,46 @@ export default function balancer(backends: FetchFn[]) {
       req = new Request(req)
     }
     const attempted = new Set<Backend>()
+
     while (attempted.size < tracked.length) {
-      let backend: Backend | null = null
       const [backendA, backendB] = chooseBackends(tracked, attempted)
 
-      if (!backendA) {
-        return new Response("No backend available", { status: 502 })
-      }
-      if (!backendB) {
-        backend = backendA
-      } else {
-        // randomize between 2 good candidates
-        backend = (Math.floor(Math.random() * 2) == 0) ? backendA : backendB
-      }
+      if (!backendA) return new Response("No backend available", { status: 502 })
+
+      // randomize between two to not overload
+      const backend = !backendB
+        ? backendA
+        : (Math.floor(Math.random() * 2) == 0) ? backendA : backendB
 
       const promise = backend.proxy(req, init)
-      if (backend.scoredRequestCount != backend.requestCount) {
-        // fixup score
-        // this should be relatively concurrent with the fetch promise
-        score(backend)
-      }
+
+      // score backends for future selection
+      if (backend.scoredRequestCount != backend.requestCount) score(backend)
       backend.requestCount += 1
       attempted.add(backend)
 
       let resp: Response
+      let latency = 0
       try {
+        const requestStart = new Date().getTime()
         resp = await promise
+        latency = new Date().getTime() - requestStart
       } catch (e) {
         resp = proxyError
       }
+
       if (backend.statuses.length < 10) {
         backend.statuses.push(resp.status)
+        backend.latencies.push(latency)
       } else {
         backend.statuses[(backend.requestCount - 1) % backend.statuses.length] = resp.status
+        backend.latencies[(backend.requestCount - 1) % backend.latencies.length] = latency
       }
 
       if (resp.status >= 500 && resp.status < 600) {
         backend.lastError = Date.now()
-        // always recompute score on errors
         score(backend)
-
-        // clear out response to trigger retry
-        if (canRetry(req, resp)) {
-          continue
-        }
+        if (canRetry(req, resp)) continue
       }
 
       return resp
@@ -87,7 +98,9 @@ export default function balancer(backends: FetchFn[]) {
 
   return Object.assign(fn, { backends: tracked })
 }
+
 const proxyError = new Response("couldn't connect to origin", { status: 502 })
+
 export interface FetchFn {
   (req: RequestInfo, init?: RequestInit | undefined): Promise<Response>
 }
@@ -100,38 +113,84 @@ export interface Backend {
   requestCount: 0,
   scoredRequestCount: 0,
   statuses: number[],
+  latencies: number[],
   lastError: number,
   healthScore: number,
+  latencyScore: number,
+  score: number,
   errorCount: 0
 }
-// compute a backend health score with time + status codes
+
 function score(backend: Backend, errorBasis?: number) {
   if (typeof errorBasis !== "number" && !errorBasis) errorBasis = Date.now()
 
   const timeSinceError = (errorBasis - backend.lastError)
-  const statuses = backend.statuses
+  const { statuses, latencies } = backend
   const timeWeight = (backend.lastError === 0 && 0) ||
     ((timeSinceError < 1000) && 1) ||
     ((timeSinceError < 3000) && 0.8) ||
     ((timeSinceError < 5000) && 0.3) ||
     ((timeSinceError < 10000) && 0.1) ||
     0;
-  if (statuses.length == 0) return 0
-  let requests = 0
-  let errors = 0
-  for (let i = 0; i < statuses.length; i++) {
-    const status = statuses[i]
-    if (status && !isNaN(status)) {
-      requests += 1
-      if (status >= 500 && status < 600) {
-        errors += 1
-      }
-    }
-  }
-  const score = (1 - (timeWeight * (errors / requests)))
-  backend.healthScore = score
+  const measuresTaken = latencies.filter(l => !!l).length
+
+  if (measuresTaken < 2) return [0, 0, 0]
+  let errors = statuses.reduce(
+    (acc, s) => (s && !isNaN(s) && s >= 500 && s < 600) ? ++acc : acc,
+    0
+  )
+  const healthScore = parseFloat((1 - (timeWeight * (errors / measuresTaken))).toFixed(2))
+
+  let beyondAllowedLatencyDeviation = 0
+
+  const LATENCY_SCORE_PING_WEIGHT = 1 - LATENCY_SCORE_INSTABILITY_WEIGHT
+
+  // get the middle latency so as to drop the extreme ends of the spectrum
+  const sortedLatencies = latencies.sort((l1, l2) => {
+    if (l1 > l2) return 1
+    if (l1 < l2) return -1
+    return 0
+  })
+  const middleLatency = sortedLatencies[Math.floor(measuresTaken / 2)]
+  const averageLatency = sortedLatencies.reduce(
+    (acc, l) => {
+      if (Math.abs(acc - l) < LATENCY_DEVIATION_ALLOWED) return (acc + l) / 2
+      beyondAllowedLatencyDeviation += 1
+      return acc
+    },
+    middleLatency
+  )
+
+  /*
+  calculates how many times the value flucutates beyond the expected latency and allowed latency thresholds
+  signalling instability in the backend
+  */
+  const correctedLatencyDeviationCount = measuresTaken > 3 ? beyondAllowedLatencyDeviation : 0
+  const instabilityScore = 1 - (correctedLatencyDeviationCount / measuresTaken)
+  const latencyDiscrepancy = averageLatency / AVERAGE_LATENCY_EXPECTED
+  /*
+  pingScore is the main latency indicator
+  ranges between 0 - 1
+  1 when the latency is the average expected or below it
+  and lower when the latency value is higher than expected
+  */
+  const pingScore = latencyDiscrepancy <= 1
+    ? 1
+    : AVERAGE_LATENCY_EXPECTED / averageLatency
+  const rawLatencyScore = parseFloat(
+    ((pingScore * LATENCY_SCORE_PING_WEIGHT) +
+      (instabilityScore * LATENCY_SCORE_INSTABILITY_WEIGHT)).toFixed(2)
+  )
+  const latencyScore = parseFloat((1 - (timeWeight * rawLatencyScore)).toFixed(2))
+
+  const score = (healthScore * HEALTH_SCORE_WEIGHT ) + (latencyScore * LATENCY_SCORE_WEIGHT)
+
   backend.scoredRequestCount = backend.requestCount
-  return score
+  backend.healthScore = healthScore
+  backend.latencyScore = latencyScore
+  backend.score = score
+  // todo: write scores to a database such as firebase for persistence
+  return [healthScore, latencyScore, score]
 }
 function canRetry(req: Request, resp: Response) {
   if (resp && resp.status < 500) return false // don't retry normal boring errors or success
@@ -170,13 +229,10 @@ function chooseBackends(backends: Backend[], attempted?: Set<Backend>) {
 }
 
 function bestBackend(b1: Backend, b2: Backend) {
-  if (
-    b1.healthScore > b2.healthScore ||
-    (b1.healthScore == b2.healthScore && b1.requestCount < b2.requestCount)
-  ) {
-    return b1
-  }
-  return b2
+  return (b1.score > b2.score ||
+    (b1.score == b2.score && b1.requestCount < b2.requestCount)
+  ) ? b1
+    : b2
 }
 
 export const _internal = {
