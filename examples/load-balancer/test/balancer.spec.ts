@@ -1,18 +1,27 @@
 import { expect } from 'chai'
-import balancer, { _internal, Backend } from "../src/balancer"
+import balancer, { _internal, FetchFn, Backend } from "../src/balancer"
 
 import { AVERAGE_LATENCY_EXPECTED } from '../balancer-config';
 
 async function fakeFetch(req: RequestInfo, init?: RequestInit) {
   return new Response("hi")
 }
+
 async function fakeFetchError(req: RequestInfo, init?: RequestInit) {
   return new Response("nooooo", { status: 502 })
 }
 
+function fakeFetchGenerator(origin: string) {
+  return fakeFetch
+}
+
+function fakeFetchErrorGenerator(origin: string) {
+  return fakeFetchError
+}
+
 function healthy() {
   return <Backend>{
-    proxy: fakeFetch.bind({}), // same function, different times
+    proxy: fakeFetch, // same function, different times
     requestCount: 0,
     statuses: Array(3).fill(200),
     latencies: Array(3).fill(AVERAGE_LATENCY_EXPECTED),
@@ -91,7 +100,7 @@ describe("balancing", () => {
   describe("backend stats", () => {
     it("should store last 10 statuses", async () => {
       const req = new Request("http://localhost/hello/")
-      const fn = balancer([fakeFetch])
+      const fn = balancer([{ fn: fakeFetchGenerator, url: '' }])
       const backend = fn.backends[0]
       const statuses = Array<number>()
       for (let i = 0; i < 20; i++) {
@@ -106,9 +115,9 @@ describe("balancing", () => {
 
     it("should retry on failure", async () => {
       const fn = balancer([
-        fakeFetchError.bind({}),
-        fakeFetchError.bind({}),
-        fakeFetch
+        { fn: fakeFetchErrorGenerator, url: '' },
+        { fn: fakeFetchErrorGenerator, url: '' },
+        { fn: fakeFetchGenerator, url: '' },
       ])
       // lower health of the last backend so we try errors first
       fn.backends[2].healthScore = 0.1

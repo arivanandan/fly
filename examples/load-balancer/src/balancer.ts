@@ -14,6 +14,7 @@
  */
 
  import {
+   BACKEND_SCORING_ROUTE,
    LATENCY_DEVIATION_ALLOWED,
    AVERAGE_LATENCY_EXPECTED,
    HEALTH_SCORE_WEIGHT,
@@ -24,13 +25,13 @@
  // todo: when the load balancer loads, get old score values from a database
  // accept the old score values as a param in the balancer
 
-export default function balancer(backends: FetchFn[]) {
-  const tracked = backends.map((h) => {
-    if (typeof h !== "function") {
-      throw Error("Backend must be a fetch like function")
+export default function balancer(backends: { fn: (origin: string) => FetchFn, url: string }[]) {
+  const tracked = backends.map(({ fn, url }) => {
+    if (typeof fn !== "function" && typeof url !== 'string') {
+      throw Error("Backend must be an object with a fetch like function fn and a string url")
     }
     return <Backend>{
-      proxy: h,
+      proxy: fn(url + BACKEND_SCORING_ROUTE),
       requestCount: 0,
       scoredRequestCount: 0,
       statuses: Array<number>(10),
